@@ -229,14 +229,14 @@
         
         <div class="legend-item">
             <div class="legend-color closing"></div>
-            <span>Schools CLOSING (2)</span>
+            <span>Schools CLOSING (3)</span>
         </div>
         <div class="legend-item">
             <div class="legend-color staying"></div>
-            <span>Schools STAYING OPEN (12)</span>
+            <span>Schools STAYING OPEN (11)</span>
         </div>
         <div class="legend-item">
-            <div class="legend-color impact-high"></div>
+            <div class="legend-color impact-high"></div>Bethesda Elementary
             <span>Impact Zone (property decline)</span>
         </div>
         <div class="legend-item">
@@ -257,7 +257,6 @@
         let geocodedSchools = { closing: [], staying: [] };
         let censusLayer = null;
         
-        // ⚠️ WARNING: This Census API key is exposed in client-side code
         // For production, move to a backend environment variable
         // Regenerate key at: https://api.census.gov/data/key_signup.html
         const CENSUS_API_KEY = 'ae6b9c44c43bfc73a2cd966a003aef032af8eef0';
@@ -284,7 +283,16 @@
                     hispanicCount: 182,
                     impact: "8-10% property value decline",
                     impactAmount: "$30,000-$37,000 per home"
-                }
+                },
+
+                {
+                    name: "Whittier Elementary",
+                    address: "1103 East Avenue, Waukesha, WI 53186",
+                    enrollment: 142,
+                    hispanic: 34.5,
+                    impact: "8-10% property value decline", 
+                    impactAmount: "$30,000-$37,000 per home"
+                } 
             ],
             staying: [
                 {
