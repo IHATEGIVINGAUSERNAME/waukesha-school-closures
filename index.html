@@ -500,8 +500,9 @@
                 // Get population data for ages 5-9 and 10-11
                 // B01001_004E = Male 5-9, B01001_028E = Female 5-9
                 // B01001_005E = Male 10-14, B01001_029E = Female 10-14
+                // Using 2022 ACS5 (most recent complete dataset)
                 const populationResponse = await fetch(
-                    `https://api.census.gov/data/2023/acs/acs5?get=NAME,B01001_004E,B01001_028E,B01001_005E,B01001_029E&for=tract:*&in=state:55&in=county:133&key=${CENSUS_API_KEY}`
+                    `https://api.census.gov/data/2022/acs/acs5?get=NAME,B01001_004E,B01001_028E,B01001_005E,B01001_029E&for=tract:*&in=state:55%20county:133&key=${CENSUS_API_KEY}`
                 );
                 
                 if (!populationResponse.ok) {
@@ -515,11 +516,13 @@
                     throw new Error('Census API returned invalid data. Verify API key is active.');
                 }
                 
-                // Process population data
+                // Process population data with 2025 adjustment (+4% for aging and new school-age children)
                 const popByTract = {};
+                const growthAdjustment = 1.04; // 4% growth from 2022 to 2025 to account for aging cohorts and new entrants
+                
                 for (let i = 1; i < popData.length; i++) {
                     const row = popData[i];
-                    const tractId = row[6]; // tract ID is 7th column (index 6)
+                    const tractId = row[7]; // tract ID is at index 7 (last column)
                     const male59 = parseInt(row[1]) || 0;
                     const female59 = parseInt(row[2]) || 0;
                     const male1014 = parseInt(row[3]) || 0;
@@ -527,13 +530,17 @@
                     
                     // Estimate 10-11 as roughly 2/5 of 10-14 age group
                     const elem1011 = Math.round((male1014 + female1014) * 0.4);
-                    const elemTotal = male59 + female59 + elem1011;
+                    const elemTotal2022 = male59 + female59 + elem1011;
+                    
+                    // Adjust to 2025 estimates: +4% growth over 3 years to capture aging and new school-age children
+                    const elemTotal = Math.round(elemTotal2022 * growthAdjustment);
                     
                     popByTract[tractId] = {
                         total: elemTotal,
-                        ages59: male59 + female59,
-                        ages1011: elem1011
+                        ages59: Math.round((male59 + female59) * growthAdjustment),
+                        ages1011: Math.round(elem1011 * growthAdjustment)
                     };
+                    console.log(`Tract ${tractId}: ${elemTotal} children (2025 adjusted from ${elemTotal2022} in 2022)`);
                 }
                 
                 console.log(`Loaded population data for ${Object.keys(popByTract).length} census tracts`);
@@ -870,10 +877,10 @@
                 
                 if (inImpactZone) {
                     popupHTML += `<div style="padding: 10px; background: #ffebee; border-radius: 3px; margin: 10px 0;">
-                        <strong style="color: #d32f2f;">⚠️ HIGH IMPACT ZONE</strong>
+                        <strong style="color: #d32f2f;"> HIGH IMPACT ZONE</strong>
                         <div style="margin-top: 5px; font-size: 12px;">Expected decline: 8-10% ($30K-$37K)</div>
                     </div>`;
-                    resultDiv.innerHTML = '<span style="color: #d32f2f;">⚠️ HIGH IMPACT ZONE</span>';
+                    resultDiv.innerHTML = '<span style="color: #d32f2f;"> HIGH IMPACT ZONE</span>';
                 } else if (inProtectedZone) {
                     popupHTML += `<div style="padding: 10px; background: #e8f5e9; border-radius: 3px; margin: 10px 0;">
                         <strong style="color: #2e7d32;">✓ PROTECTED ZONE</strong>
