@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Waukesha School Closures - Interactive Map</title>
+    <title>Waukesha School Closures - Interactive Map with Census Data</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" 
           integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" 
           crossorigin=""/>
@@ -65,6 +65,8 @@
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.2);
             z-index: 1000;
+            max-height: 60vh;
+            overflow-y: auto;
         }
         
         .legend h3 {
@@ -150,12 +152,26 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+
+        .census-gradient {
+            background: linear-gradient(to right, #ffffcc, #ffeda0, #fed976, #feb24c, #fd8d3c, #fc4e2a, #e31a1c, #bd0026, #800026);
+            height: 15px;
+            width: 100%;
+            border-radius: 3px;
+        }
+
+        .gradient-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            margin-top: 2px;
+        }
     </style>
 </head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
-        <div>Loading schools from addresses...</div>
+        <div id="loadingText">Loading schools and census data...</div>
     </div>
     
     <div id="map"></div>
@@ -185,8 +201,15 @@
         <p><strong>Property Value Loss:</strong> $58-73M in closure zones</p>
         <p><strong>Board Vote:</strong> 8-1 (partisan split)</p>
         
+        <div style="margin-top: 15px; padding: 10px; background: #e3f2fd; border-radius: 5px;">
+            <p style="margin: 5px 0; font-weight: bold; font-size: 12px;">📊 Census Data Layer</p>
+            <p style="margin: 5px 0; font-size: 11px;">Shows elementary-age children (5-11 years) by neighborhood</p>
+            <p style="margin: 5px 0; font-size: 11px; color: #666;">Darker red = More children in that area</p>
+        </div>
+        
         <p style="font-size: 11px; margin-top: 15px; color: #666;">
             Map geocoded from school addresses<br>
+            Census: American Community Survey 2022<br>
             Red zones = Impact areas<br>
             Green zones = Protected areas
         </p>
@@ -194,6 +217,16 @@
     
     <div class="legend">
         <h3>Legend</h3>
+        
+        <div style="margin-bottom: 15px;">
+            <div style="font-size: 12px; font-weight: bold; margin-bottom: 5px;">Elementary Age Population (5-11)</div>
+            <div class="census-gradient"></div>
+            <div class="gradient-labels">
+                <span>Low</span>
+                <span>High</span>
+            </div>
+        </div>
+        
         <div class="legend-item">
             <div class="legend-color closing"></div>
             <span>Schools CLOSING (2)</span>
@@ -222,8 +255,15 @@
         let map;
         let searchMarker = null;
         let geocodedSchools = { closing: [], staying: [] };
+        let censusLayer = null;
         
-        // School addresses - NO HARDCODED COORDINATES
+        // ⚠️ WARNING: This Census API key is exposed in client-side code
+        // For production, move to a backend environment variable
+        // Regenerate key at: https://api.census.gov/data/key_signup.html
+        const CENSUS_API_KEY = 'ae6b9c44c43bfc73a2cd966a003aef032af8eef0';
+        const WAUKESHA_COUNTY_FIPS = '55133'; // Wisconsin (55), Waukesha County (133)
+        
+        // School addresses
         const schoolAddresses = {
             closing: [
                 {
@@ -308,7 +348,7 @@
             ]
         };
 
-        // School Board Members with addresses it is public data so screw them
+        // School Board Members
         const schoolBoardMembers = [
             {
                 name: "Kelly Piacsek",
@@ -364,63 +404,266 @@
                 address: "1115 River Place Blvd., Waukesha, WI 53189",
                 email: "tharland@waukesha.k12.wi.us"
             }
- 
         ];
         
         let geocodedBoardMembers = [];
         
+        // Geocoding cache to avoid duplicate requests
+        const geocodeCache = {};
+        
+        // Geocode a single address with caching
         async function geocodeAddress(address) {
-            const response = await fetch(
-                `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`
-            );
-            const data = await response.json();
-            if (data.length > 0) {
-                return {
-                    lat: parseFloat(data[0].lat),
-                    lng: parseFloat(data[0].lon)
-                };
+            // Check cache first
+            if (geocodeCache[address]) {
+                return geocodeCache[address];
+            }
+            
+            try {
+                const response = await fetch(
+                    `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`
+                );
+                const data = await response.json();
+                if (data.length > 0) {
+                    const result = {
+                        lat: parseFloat(data[0].lat),
+                        lng: parseFloat(data[0].lon)
+                    };
+                    // Cache the result
+                    geocodeCache[address] = result;
+                    return result;
+                }
+            } catch (error) {
+                console.error(`Geocoding error for "${address}":`, error);
             }
             return null;
         }
         
+        // Batch geocode multiple addresses with rate limiting
+        async function batchGeocodeAddresses(addresses, delayMs = 1100) {
+            const results = {};
+            
+            for (const address of addresses) {
+                results[address] = await geocodeAddress(address);
+                // Rate limit: respect Nominatim's 1 request/second guideline
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+            
+            return results;
+        }
+        
+        // Fetch census tract boundaries and population data
+        async function loadCensusData() {
+            updateLoadingText('Loading census tract boundaries...');
+            
+            try {
+                // Get census tract boundaries from Census Bureau TIGERweb
+                const tractResponse = await fetch(
+                    `https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/tigerWMS_Census2020/MapServer/8/query?where=COUNTY='133'+AND+STATE='55'&outFields=*&outSR=4326&f=geojson`
+                );
+                const tractData = await tractResponse.json();
+                
+                // Tighter bounds based on school locations - Waukesha city proper
+                const schoolDistrictBounds = {
+                    minLat: 42.96,
+                    maxLat: 43.08,
+                    minLng: -88.32,
+                    maxLng: -88.18
+                };
+                
+                tractData.features = tractData.features.filter(feature => {
+                    if (!feature.geometry || !feature.geometry.coordinates) return false;
+                    
+                    // Get centroid of tract
+                    const rings = feature.geometry.coordinates[0];
+                    let sumLat = 0, sumLng = 0, count = 0;
+                    
+                    rings.forEach(coord => {
+                        sumLng += coord[0];
+                        sumLat += coord[1];
+                        count++;
+                    });
+                    
+                    const centroidLng = sumLng / count;
+                    const centroidLat = sumLat / count;
+                    
+                    // Keep only tracts within tighter school district bounds
+                    return centroidLat >= schoolDistrictBounds.minLat && 
+                           centroidLat <= schoolDistrictBounds.maxLat &&
+                           centroidLng >= schoolDistrictBounds.minLng && 
+                           centroidLng <= schoolDistrictBounds.maxLng;
+                });
+                
+                updateLoadingText('Loading elementary-age population data...');
+                
+                console.log(`Filtered to ${tractData.features.length} census tracts in school district area`);
+                
+                // Get population data for ages 5-9 and 10-11
+                // B01001_004E = Male 5-9, B01001_028E = Female 5-9
+                // B01001_005E = Male 10-14, B01001_029E = Female 10-14
+                const populationResponse = await fetch(
+                    `https://api.census.gov/data/2023/acs/acs5?get=NAME,B01001_004E,B01001_028E,B01001_005E,B01001_029E&for=tract:*&in=state:55&in=county:133&key=${CENSUS_API_KEY}`
+                );
+                
+                if (!populationResponse.ok) {
+                    throw new Error(`Census API error: ${populationResponse.status}. Key may be invalid or expired.`);
+                }
+                
+                const popData = await populationResponse.json();
+                
+                // Check for Census API errors
+                if (!Array.isArray(popData) || popData.length === 0) {
+                    throw new Error('Census API returned invalid data. Verify API key is active.');
+                }
+                
+                // Process population data
+                const popByTract = {};
+                for (let i = 1; i < popData.length; i++) {
+                    const row = popData[i];
+                    const tractId = row[6]; // tract ID is 7th column (index 6)
+                    const male59 = parseInt(row[1]) || 0;
+                    const female59 = parseInt(row[2]) || 0;
+                    const male1014 = parseInt(row[3]) || 0;
+                    const female1014 = parseInt(row[4]) || 0;
+                    
+                    // Estimate 10-11 as roughly 2/5 of 10-14 age group
+                    const elem1011 = Math.round((male1014 + female1014) * 0.4);
+                    const elemTotal = male59 + female59 + elem1011;
+                    
+                    popByTract[tractId] = {
+                        total: elemTotal,
+                        ages59: male59 + female59,
+                        ages1011: elem1011
+                    };
+                }
+                
+                console.log(`Loaded population data for ${Object.keys(popByTract).length} census tracts`);
+                console.log('Sample tract data:', Object.values(popByTract).slice(0, 3));
+                
+                // Find min/max for color scaling
+                const populations = Object.values(popByTract).map(p => p.total);
+                const minPop = Math.min(...populations);
+                const maxPop = Math.max(...populations);
+                
+                console.log(`Elementary age population range: ${minPop} - ${maxPop}`);
+                console.log(`Average: ${Math.round(populations.reduce((a,b) => a+b, 0) / populations.length)}`);
+                
+                // Add population data to GeoJSON features
+                tractData.features.forEach(feature => {
+                    const tractId = feature.properties.TRACT;
+                    if (popByTract[tractId]) {
+                        feature.properties.elemPop = popByTract[tractId].total;
+                        feature.properties.ages59 = popByTract[tractId].ages59;
+                        feature.properties.ages1011 = popByTract[tractId].ages1011;
+                    } else {
+                        feature.properties.elemPop = 0;
+                    }
+                });
+                
+                // Color function
+                function getColor(population) {
+                    const ratio = (population - minPop) / (maxPop - minPop);
+                    const colors = [
+                        '#ffffcc', '#ffeda0', '#fed976', '#feb24c', 
+                        '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026'
+                    ];
+                    const index = Math.min(Math.floor(ratio * colors.length), colors.length - 1);
+                    return colors[index];
+                }
+                
+                // Add census layer to map
+                censusLayer = L.geoJSON(tractData, {
+                    style: function(feature) {
+                        return {
+                            fillColor: getColor(feature.properties.elemPop || 0),
+                            weight: 1,
+                            opacity: 0.5,
+                            color: '#666',
+                            fillOpacity: 0.5
+                        };
+                    },
+                    onEachFeature: function(feature, layer) {
+                        const props = feature.properties;
+                        const popupContent = `
+                            <div style="font-size: 12px;">
+                                <strong>Census Tract ${props.TRACT}</strong><br>
+                                <strong>Elementary Age (5-11):</strong> ${props.elemPop || 0} children<br>
+                                <span style="font-size: 11px;">
+                                    Ages 5-9: ${props.ages59 || 0}<br>
+                                    Ages 10-11: ${props.ages1011 || 0}
+                                </span>
+                            </div>
+                        `;
+                        layer.bindPopup(popupContent);
+                    }
+                }).addTo(map);
+                
+                return true;
+            } catch (error) {
+                console.error('Error loading census data:', error);
+                updateLoadingText('Census data unavailable - showing schools only');
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                return false;
+            }
+        }
+        
+        function updateLoadingText(text) {
+            document.getElementById('loadingText').textContent = text;
+        }
+        
+        // Geocode all schools
         async function geocodeAllSchools() {
             const loadingDiv = document.getElementById('loading');
             
             try {
-
+                updateLoadingText('Geocoding schools...');
+                
+                // Collect all addresses to geocode
+                const closingAddresses = schoolAddresses.closing.map(s => s.address);
+                const stayingAddresses = schoolAddresses.staying.map(s => s.address);
+                const boardAddresses = schoolBoardMembers.map(m => m.address);
+                const allAddresses = [...closingAddresses, ...stayingAddresses, ...boardAddresses];
+                
+                // Remove duplicates
+                const uniqueAddresses = [...new Set(allAddresses)];
+                
+                // Batch geocode all addresses with rate limiting
+                const results = await batchGeocodeAddresses(uniqueAddresses);
+                
+                // Map results back to closing schools
                 for (const school of schoolAddresses.closing) {
-                    const coords = await geocodeAddress(school.address);
+                    const coords = results[school.address];
                     if (coords) {
                         geocodedSchools.closing.push({ ...school, ...coords });
                     }
-
-                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
                 
-     
+                // Map results back to staying schools
                 for (const school of schoolAddresses.staying) {
-                    const coords = await geocodeAddress(school.address);
+                    const coords = results[school.address];
                     if (coords) {
                         geocodedSchools.staying.push({ ...school, ...coords });
                     }
-                    // Rate limiting
-                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
                 
-     
+                updateLoadingText('Geocoding school board members...');
+                
+                // Map results back to board members
                 for (const member of schoolBoardMembers) {
-                    const coords = await geocodeAddress(member.address);
+                    const coords = results[member.address];
                     if (coords) {
                         geocodedBoardMembers.push({ ...member, ...coords });
                     }
-                    // Rate limiting
-                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
                 
-                loadingDiv.style.display = 'none';
+                // Initialize map
                 initMap();
+                
+                // Load census data
+                await loadCensusData();
+                
+                loadingDiv.style.display = 'none';
             } catch (error) {
-                loadingDiv.innerHTML = `<div style="color: #d32f2f;">Error loading schools: ${error.message}</div>`;
+                loadingDiv.innerHTML = `<div style="color: #d32f2f;">Error loading data: ${error.message}</div>`;
             }
         }
         
@@ -433,7 +676,7 @@
                 maxZoom: 18
             }).addTo(map);
             
-
+            // Create custom icons
             const closingIcon = L.divIcon({
                 className: 'custom-marker',
                 html: '<div style="background: #d32f2f; width: 50px; height: 50px; border-radius: 50%; border: 5px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.5);"></div>',
@@ -448,7 +691,7 @@
                 iconAnchor: [10, 10]
             });
             
-     
+            // Add closing schools
             geocodedSchools.closing.forEach(school => {
                 const popupContent = `
                     <div class="school-popup">
@@ -471,7 +714,7 @@
                     .bindPopup(popupContent, { maxWidth: 300 })
                     .addTo(map);
                 
-                // Large impact zone
+                // Impact zone
                 L.circle([school.lat, school.lng], {
                     radius: 2000,
                     color: '#d32f2f',
@@ -481,7 +724,7 @@
                 }).addTo(map);
             });
             
-            
+            // Add staying schools
             geocodedSchools.staying.forEach(school => {
                 let popupContent = `
                     <div class="school-popup">
@@ -518,7 +761,7 @@
                     .bindPopup(popupContent, { maxWidth: 300 })
                     .addTo(map);
                 
-             
+                // Protected zone
                 L.circle([school.lat, school.lng], {
                     radius: 1500,
                     color: '#2e7d32',
@@ -529,7 +772,7 @@
                 }).addTo(map);
             });
             
-       
+            // Heat map
             const heatData = geocodedSchools.closing.map(school => [school.lat, school.lng, 1.0]);
             L.heatLayer(heatData, {
                 radius: 40,
@@ -539,7 +782,7 @@
                 gradient: { 0.2: '#ffeda0', 0.4: '#fed976', 0.6: '#feb24c', 0.8: '#fd8d3c', 1.0: '#e31a1c' }
             }).addTo(map);
 
-       
+            // Add school board members
             const boardMemberIcon = L.divIcon({
                 className: 'custom-marker',
                 html: '<div style="background: #ff6b35; width: 30px; height: 40px; border-radius: 50% 50% 50% 0; border: 2px solid white; box-shadow: 0 3px 8px rgba(0,0,0,0.4); transform: rotate(-45deg);"></div><div style="position: absolute; top: 8px; left: 50%; transform: translate(-50%, 0); color: white; font-size: 16px; font-weight: bold;">📌</div>',
@@ -627,16 +870,16 @@
                 
                 if (inImpactZone) {
                     popupHTML += `<div style="padding: 10px; background: #ffebee; border-radius: 3px; margin: 10px 0;">
-                        <strong style="color: #d32f2f;"> HIGH IMPACT ZONE</strong>
+                        <strong style="color: #d32f2f;">⚠️ HIGH IMPACT ZONE</strong>
                         <div style="margin-top: 5px; font-size: 12px;">Expected decline: 8-10% ($30K-$37K)</div>
                     </div>`;
-                    resultDiv.innerHTML = '<span style="color: #d32f2f;"> HIGH IMPACT ZONE</span>';
+                    resultDiv.innerHTML = '<span style="color: #d32f2f;">⚠️ HIGH IMPACT ZONE</span>';
                 } else if (inProtectedZone) {
                     popupHTML += `<div style="padding: 10px; background: #e8f5e9; border-radius: 3px; margin: 10px 0;">
-                        <strong style="color: #2e7d32;"> PROTECTED ZONE</strong>
+                        <strong style="color: #2e7d32;">✓ PROTECTED ZONE</strong>
                         <div style="margin-top: 5px; font-size: 12px;">Property values safe</div>
                     </div>`;
-                    resultDiv.innerHTML = '<span style="color: #2e7d32;"> PROTECTED ZONE</span>';
+                    resultDiv.innerHTML = '<span style="color: #2e7d32;">✓ PROTECTED ZONE</span>';
                 } else {
                     popupHTML += `<div style="padding: 10px; background: #fff3cd; border-radius: 3px; margin: 10px 0;">
                         <strong>Outside primary zones</strong>
@@ -668,7 +911,7 @@
             if (e.key === 'Enter') searchAddress();
         });
         
-        // Start geocoding on page load
+        // Start loading
         geocodeAllSchools();
     </script>
 </body>
