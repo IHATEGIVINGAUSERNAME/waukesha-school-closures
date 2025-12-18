@@ -518,18 +518,38 @@
         // Geocoding cache to avoid duplicate requests
         const CACHE_KEY = 'waukesha_geocode_cache';
         const CACHE_VERSION = '1.0'; // Increment this to invalidate old caches
-        const geocodeCache = loadCacheFromLocalStorage();
+        const CACHE_FILE = 'waukesha_geocode_cache.json';
+        let geocodeCache = {};
+        let cacheLoaded = false;
         
-        // Load cache from localStorage
-        function loadCacheFromLocalStorage() {
+        // Load cache from JSON file first, then fall back to localStorage
+        async function loadGeocodeCache() {
+            try {
+                // Try to load from JSON file first
+                const response = await fetch(CACHE_FILE);
+                if (response.ok) {
+                    const fileCache = await response.json();
+                    if (fileCache.version === CACHE_VERSION && fileCache.data) {
+                        geocodeCache = fileCache.data;
+                        console.log(`Loaded ${Object.keys(geocodeCache).length} cached geocode results from ${CACHE_FILE}`);
+                        cacheLoaded = true;
+                        return;
+                    }
+                }
+            } catch (error) {
+                console.warn('Could not load cache from file, trying localStorage:', error);
+            }
+            
+            // Fall back to localStorage if file not available
             try {
                 const cached = localStorage.getItem(CACHE_KEY);
                 if (cached) {
                     const parsed = JSON.parse(cached);
-                    // Check if cache version matches
                     if (parsed.version === CACHE_VERSION) {
-                        console.log(`Loaded ${Object.keys(parsed.data).length} cached geocode results from browser storage`);
-                        return parsed.data;
+                        geocodeCache = parsed.data;
+                        console.log(`Loaded ${Object.keys(geocodeCache).length} cached geocode results from browser storage`);
+                        cacheLoaded = true;
+                        return;
                     } else {
                         console.log('Cache version mismatch, clearing old cache');
                         localStorage.removeItem(CACHE_KEY);
@@ -538,7 +558,8 @@
             } catch (error) {
                 console.error('Error loading cache from localStorage:', error);
             }
-            return {};
+            
+            cacheLoaded = true;
         }
         
         // Save cache to localStorage
@@ -553,6 +574,29 @@
                 console.log(`Saved ${Object.keys(geocodeCache).length} geocode results to browser storage`);
             } catch (error) {
                 console.error('Error saving cache to localStorage:', error);
+            }
+        }
+        
+        // Update addresses in background after initial load
+        async function updateAddressesInBackground(addresses) {
+            try {
+                console.log('Background update: Geocoding missing addresses...');
+                
+                // Batch geocode uncached addresses
+                const newResults = await batchGeocodeAddresses(addresses, 1100, 5);
+                
+                // Merge new results into cache
+                Object.assign(geocodeCache, newResults);
+                
+                // Save updated cache to localStorage
+                saveCacheToLocalStorage();
+                
+                console.log('Background update: Complete. Cache updated with new addresses.');
+                
+                // Optionally notify user that cache was updated
+                console.log('💾 Geocode cache updated with latest addresses');
+            } catch (error) {
+                console.error('Background update failed:', error);
             }
         }
         
@@ -612,7 +656,7 @@
                 const totalBatches = Math.ceil(uncachedAddresses.length / concurrentBatchSize);
                 
                 const processedSoFar = Math.min(i + batch.length, uncachedAddresses.length);
-                console.log(`Processing batch ${batchNum}/${totalBatches} (${batch.length} addresses)...`);
+                console.log(`Processing ${batchNum}/${totalBatches} (${batch.length} addresses)...`);
                 updateLoadingText(`Geocoding schools: \n Processing batch - ${processedSoFar}/${uncachedAddresses.length} addresses`);
                 
                 // Fire all requests in this batch concurrently
@@ -807,7 +851,11 @@
             const loadingDiv = document.getElementById('loading');
             
             try {
-                updateLoadingText('Geocoding schools...');
+                // Load cache from file first
+                updateLoadingText('Loading geocode cache...');
+                await loadGeocodeCache();
+                
+                updateLoadingText('Loading schools from cache...');
                 
                 // Collect all addresses to geocode
                 const closingAddresses = schoolAddresses.closing.map(s => s.address);
@@ -818,8 +866,19 @@
                 // Remove duplicates
                 const uniqueAddresses = [...new Set(allAddresses)];
                 
-                // Batch geocode all addresses with rate limiting
-                const results = await batchGeocodeAddresses(uniqueAddresses);
+                // Use cached data immediately for fast loading
+                const results = {};
+                const uncachedAddresses = [];
+                
+                uniqueAddresses.forEach(address => {
+                    if (geocodeCache[address]) {
+                        results[address] = geocodeCache[address];
+                    } else {
+                        uncachedAddresses.push(address);
+                    }
+                });
+                
+                console.log(`Using ${Object.keys(results).length} cached addresses, ${uncachedAddresses.length} need geocoding`);
                 
                 // Map results back to closing schools
                 for (const school of schoolAddresses.closing) {
@@ -837,8 +896,6 @@
                     }
                 }
                 
-                updateLoadingText('Geocoding school board members...');
-                
                 // Map results back to board members
                 for (const member of schoolBoardMembers) {
                     const coords = results[member.address];
@@ -847,13 +904,19 @@
                     }
                 }
                 
-                // Initialize map
+                // Initialize map immediately with cached data
                 initMap();
                 
                 // Load census data
                 await loadCensusData();
                 
                 loadingDiv.style.display = 'none';
+                
+                // Update any missing addresses in the background after map is loaded
+                if (uncachedAddresses.length > 0) {
+                    console.log(`Updating ${uncachedAddresses.length} uncached addresses in background...`);
+                    updateAddressesInBackground(uncachedAddresses);
+                }
             } catch (error) {
                 loadingDiv.innerHTML = `<div style="color: #d32f2f;">Error loading data: ${error.message}</div>`;
             }
